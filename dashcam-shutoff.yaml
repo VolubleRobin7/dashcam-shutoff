@@ -1,0 +1,182 @@
+# Created by VolubleRobin7
+# https://github.com/VolubleRobin7/dashcam-shutoff
+
+# Last tested and confirmed working in ESPHome 2025.2.2
+
+esphome:
+  name: dashcam-shutoff
+  friendly_name: "Dashcam Shutoff"
+  comment: "A small device for turning off the dashcam while parked at home."
+  on_boot:
+    - priority: 400 
+      then:
+        - light.turn_on: 
+            id: board_led
+            effect: Strobe
+        - lambda: |-
+            gpio_deep_sleep_hold_en();
+        - if: 
+            condition:
+              - binary_sensor.is_on: accessory_power
+            then: 
+              - switch.turn_on: dashcam_switch
+    - priority: -100
+      then: 
+        - delay: 1min
+        - if:
+            condition:
+              wifi.connected
+            else: 
+              - wifi.disable
+              - logger.log: "No WiFi connection found, disabling WiFi"
+              - script.execute: power_check_script
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  ap:
+    ssid: "Dashcam-Shutoff Fallback Hotspot"
+    password: !secret ap_password
+  on_connect:
+    - script.execute: power_check_script
+
+captive_portal:
+    
+web_server:
+  port: 80
+  auth:
+    username: !secret web_username
+    password: !secret web_password
+
+output:
+  - platform: gpio
+    pin: GPIO02
+    id: board_led_output
+  - platform: gpio
+    pin: GPIO26
+    id: dashcam_output
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO33
+      mode: 
+        input: true
+        pullup: true
+      inverted: true
+    id: accessory_power
+    name: "Accessory Power"
+    on_press: 
+      then:
+        - switch.turn_on: dashcam_switch
+    on_state: 
+      then:
+        - script.execute: power_check_script
+  - platform: switch
+    name: "Dashcam Power"
+    source_id: dashcam_switch
+    device_class: power
+        
+
+light:
+  - platform: binary
+    output: board_led_output
+    id: board_led
+    effects:
+      - strobe
+
+switch:
+  - platform: output
+    output: dashcam_output
+    id: dashcam_switch
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      then:
+        - lambda: |-
+            gpio_hold_en(GPIO_NUM_26);
+    on_turn_off:
+      then:
+        - lambda: |-
+            gpio_hold_dis(GPIO_NUM_26);
+  - platform: template
+    id: block_sleep
+    name: "Block Sleep"
+    optimistic: true
+    entity_category: "config"
+    turn_on_action: 
+      then:
+        - deep_sleep.prevent: sleepy
+    turn_off_action: 
+      then:
+        - deep_sleep.allow: sleepy
+        - script.execute: power_check_script
+  - platform: template
+    id: block_power_off
+    name: "Block Power Off"
+    optimistic: true
+    entity_category: "config"
+            
+
+button:
+  - platform: restart
+    id: restart_button
+    name: "Restart Device"
+    entity_category: "config"
+
+deep_sleep:
+  id: sleepy
+  wakeup_pin:
+    number: GPIO32
+    mode: 
+      input: true
+      pullup: true
+    inverted: true
+  wakeup_pin_mode: INVERT_WAKEUP
+  sleep_duration: 48h
+
+sensor:
+  - platform: template
+    name: "Wakeup Cause"
+    accuracy_decimals: 0
+    lambda: return esp_sleep_get_wakeup_cause();
+
+script:
+  - id: power_check_script
+    mode: restart
+    then:
+      - logger.log: "Delaying to allow for online connection and changes..."
+      - delay: 2min
+      - logger.log: "Checking accessory power state..."
+      - if:
+          condition:
+            binary_sensor.is_on: accessory_power
+          then:
+            - switch.turn_on: dashcam_switch
+          else:
+            - if: 
+                all: 
+                  - wifi.connected
+                  - switch.is_off: block_power_off
+                then:
+                  - switch.turn_off: dashcam_switch
+                else:
+                  - switch.turn_on: dashcam_switch
+      - if:
+          condition:
+            switch.is_off: block_sleep
+          then:
+            - deep_sleep.enter: sleepy
+          else:
+            - logger.log: "Block sleep is enabled. Not entering deep sleep."
